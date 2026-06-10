@@ -147,6 +147,12 @@ pub fn Create(comptime variant: InterfaceType) type {
             const path_z = try allocator.dupeZ(u8, path);
             defer allocator.free(path_z);
             const wd = std.os.linux.inotify_add_watch(self.inotify_fd, path_z, watch_mask);
+
+            if (wd > std.math.maxInt(i32)) {
+                std.log.err("inotify_add_watch returned wd {d} which does not fit in i32, path: {s}", .{ wd, path });
+                return error.WatchFailed;
+            }
+
             switch (std.posix.errno(wd)) {
                 .SUCCESS => {},
                 else => |e| {
