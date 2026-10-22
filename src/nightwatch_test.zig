@@ -260,6 +260,43 @@ fn testModifyFile(comptime Watcher: type, io: std.Io, allocator: std.mem.Allocat
     try std.testing.expect(th.hasChange(file_path, .modified, .file));
 }
 
+fn testTruncateFile(comptime Watcher: type, io: std.Io, allocator: std.mem.Allocator) !void {
+    if (comptime !Watcher.detects_file_modifications) return error.SkipZigTest;
+
+    const TH = MakeTestHandler(Watcher);
+
+    const tmp = try makeTempDir(io, allocator);
+    defer {
+        removeTempDir(io, tmp);
+        allocator.free(tmp);
+    }
+
+    const th = try TH.init(allocator);
+    defer th.deinit();
+
+    const file_path = try std.fs.path.join(allocator, &.{ tmp, "data.txt" });
+    defer allocator.free(file_path);
+    {
+        const f = try std.Io.Dir.createFileAbsolute(io, file_path, .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io, "hello nightwatch\n");
+    }
+
+    var watcher = try Watcher.init(io, allocator, &th.handler);
+    defer watcher.deinit();
+    try watchOrSkip(Watcher, &watcher, tmp);
+    try drainEvents(Watcher, io, &watcher);
+
+    // Truncate to empty without writing, as `: > file` does.
+    {
+        const f = try std.Io.Dir.createFileAbsolute(io, file_path, .{ .truncate = true });
+        f.close(io);
+    }
+
+    try drainEvents(Watcher, io, &watcher);
+    try std.testing.expect(th.hasChange(file_path, .modified, .file));
+}
+
 fn testCloseFile(comptime Watcher: type, io: std.Io, allocator: std.mem.Allocator) !void {
     if (comptime !Watcher.emits_close_events) return error.SkipZigTest;
 
@@ -1099,6 +1136,14 @@ test "creating a file emits a 'created' event" {
 test "writing to a file emits a 'modified' event" {
     inline for (comptime std.enums.values(nw.Variant)) |variant| {
         testModifyFile(nw.Create(variant), std.testing.io, std.testing.allocator) catch |e| {
+            if (e != error.SkipZigTest) return e;
+        };
+    }
+}
+
+test "truncating a file to empty emits a 'modified' event" {
+    inline for (comptime std.enums.values(nw.Variant)) |variant| {
+        testTruncateFile(nw.Create(variant), std.testing.io, std.testing.allocator) catch |e| {
             if (e != error.SkipZigTest) return e;
         };
     }
