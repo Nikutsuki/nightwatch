@@ -140,7 +140,8 @@ fn thread_fn(self: *@This(), io: std.Io, allocator: std.mem.Allocator) void {
             if (ev.filter != EVFILT_VNODE) continue;
             const fd: std.posix.fd_t = @intCast(ev.ident);
 
-            // Check if this is a file watch: NOTE_WRITE/NOTE_EXTEND → modified.
+            // Check if this is a file watch: NOTE_WRITE/NOTE_EXTEND/NOTE_ATTRIB -> modified.
+            // A truncation without a write (`: > file`) reports only NOTE_ATTRIB.
             // Copy the path under the lock so a concurrent remove_watch cannot
             // free it before we finish using it.
             var file_path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -167,7 +168,7 @@ fn thread_fn(self: *@This(), io: std.Io, allocator: std.mem.Allocator) void {
                     };
                     continue;
                 }
-                if (ev.fflags & (NOTE_WRITE | NOTE_EXTEND) != 0)
+                if (ev.fflags & (NOTE_WRITE | NOTE_EXTEND | NOTE_ATTRIB) != 0)
                     self.handler.change(fp, EventType.modified, .file) catch |e| {
                         std.log.err("nightwatch: handler returned {s}, stopping watch thread", .{@errorName(e)});
                         return;
@@ -389,7 +390,7 @@ fn register_file_watch(self: *@This(), allocator: std.mem.Allocator, path: []con
         .ident = @intCast(fd),
         .filter = EVFILT_VNODE,
         .flags = EV_ADD | EV_ENABLE | EV_CLEAR,
-        .fflags = NOTE_WRITE | NOTE_EXTEND | NOTE_DELETE | NOTE_RENAME,
+        .fflags = NOTE_WRITE | NOTE_EXTEND | NOTE_ATTRIB | NOTE_DELETE | NOTE_RENAME,
         .data = 0,
         .udata = 0,
     };
