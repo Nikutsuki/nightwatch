@@ -24,7 +24,8 @@ pub fn Create(comptime variant: InterfaceType) type {
             .threaded => std.Io.Mutex,
             .polling => void,
         },
-        pending_renames: std.ArrayListUnmanaged(PendingRename),
+        pending_renames: std.ArrayList(PendingRename),
+        limit_logged: std.atomic.Value(bool),
         stop_pipe: switch (variant) {
             .threaded => [2]std.posix.fd_t,
             .polling => void,
@@ -35,6 +36,7 @@ pub fn Create(comptime variant: InterfaceType) type {
         },
 
         pub const watches_recursively = false;
+        pub const watches_files = false;
         pub const detects_file_modifications = true;
         pub const emits_close_events = true;
         pub const emits_rename_for_files = true;
@@ -59,7 +61,7 @@ pub fn Create(comptime variant: InterfaceType) type {
 
         pub fn init(io: std.Io, handler: *Handler) !@This() {
             const rc = std.os.linux.inotify_init1(@bitCast(in_flags));
-            if (std.posix.errno(rc) != .SUCCESS) return error.WatchFailed;
+            if (std.os.linux.errno(rc) != .SUCCESS) return error.WatchFailed;
             const inotify_fd: std.posix.fd_t = @intCast(rc);
             errdefer std.Io.Threaded.closeFd(inotify_fd);
             switch (variant) {
@@ -72,6 +74,7 @@ pub fn Create(comptime variant: InterfaceType) type {
                         .watches = .empty,
                         .watches_mutex = std.Io.Mutex.init,
                         .pending_renames = .empty,
+                        .limit_logged = .init(false),
                         .stop_pipe = stop_pipe,
                         .thread = null,
                     };
@@ -84,6 +87,7 @@ pub fn Create(comptime variant: InterfaceType) type {
                         .watches = .empty,
                         .watches_mutex = {},
                         .pending_renames = .empty,
+                        .limit_logged = .init(false),
                         .stop_pipe = {},
                         .thread = {},
                     };
@@ -143,18 +147,14 @@ pub fn Create(comptime variant: InterfaceType) type {
             }
         }
 
-        pub fn add_watch(self: *@This(), allocator: std.mem.Allocator, path: []const u8) error{ OutOfMemory, WatchFailed }!void {
-            const path_z = try allocator.dupeZ(u8, path);
+        pub fn add_watch(self: *@This(), allocator: std.mem.Allocator, path: []const u8) error{ OutOfMemory, WatchFailed, NoEntry, WatchLimitReached }!void {
+            const path_z = try allocator.dupeSentinel(u8, path, 0);
             defer allocator.free(path_z);
             const wd = std.os.linux.inotify_add_watch(self.inotify_fd, path_z, watch_mask);
-
-            if (wd > std.math.maxInt(i32)) {
-                std.log.err("inotify_add_watch returned wd {d} which does not fit in i32, path: {s}", .{ wd, path });
-                return error.WatchFailed;
-            }
-
-            switch (std.posix.errno(wd)) {
+            switch (std.os.linux.errno(wd)) {
                 .SUCCESS => {},
+                .NOENT => return error.NoEntry,
+                .NOSPC => return error.WatchLimitReached,
                 else => |e| {
                     std.log.err("nightwatch.add_watch failed: {t}", .{e});
                     return error.WatchFailed;
@@ -185,6 +185,17 @@ pub fn Create(comptime variant: InterfaceType) type {
                 self.watches.removeByPtr(entry.key_ptr);
                 return;
             }
+        }
+
+        pub fn watch_count(self: *@This()) usize {
+            if (comptime variant == .threaded) self.watches_mutex.lockUncancelable(self.io);
+            defer if (comptime variant == .threaded) self.watches_mutex.unlock(self.io);
+            return self.watches.count();
+        }
+
+        pub fn note_watch_limit(self: *@This(), path: []const u8) void {
+            if (self.limit_logged.swap(true, .monotonic)) return;
+            std.log.err("nightwatch: watch limit reached at {s} after {d} watches; not watching further paths", .{ path, self.watch_count() });
         }
 
         fn has_watch_for_path(self: *@This(), path: []const u8) bool {
@@ -254,10 +265,20 @@ pub fn Create(comptime variant: InterfaceType) type {
             var buf: [65536]u8 align(@alignOf(InotifyEvent)) = undefined;
             // Src paths for which we already emitted a paired atomic rename this
             // read, so IN_MOVE_SELF for the same inode can be suppressed.
-            var paired_src_paths: std.ArrayListUnmanaged([]u8) = .empty;
+            var paired_src_paths: std.ArrayList([]u8) = .empty;
             defer {
                 for (paired_src_paths.items) |p| allocator.free(p);
                 paired_src_paths.deinit(allocator);
+            }
+            // wds seen with IN_IGNORED this call, purged from `watches` later.
+            var to_purge: std.ArrayList(i32) = .empty;
+            defer {
+                if (comptime variant == .threaded) self.watches_mutex.lockUncancelable(self.io);
+                for (to_purge.items) |wd| {
+                    if (self.watches.fetchRemove(wd)) |kv| allocator.free(kv.value.path);
+                }
+                if (comptime variant == .threaded) self.watches_mutex.unlock(self.io);
+                to_purge.deinit(allocator);
             }
             defer {
                 // Any unpaired MOVED_FROM means the file was moved out of the watched tree.
@@ -282,6 +303,12 @@ pub fn Create(comptime variant: InterfaceType) type {
                     const ev: *const InotifyEvent = @ptrCast(@alignCast(buf[offset..].ptr));
                     const name_offset = offset + @sizeOf(InotifyEvent);
                     offset = name_offset + ev.len;
+
+                    if (ev.mask & IN.IGNORED != 0) {
+                        // The watch was removed kernel-side.
+                        to_purge.append(allocator, ev.wd) catch {};
+                        continue;
+                    }
 
                     // Copy the watched path under the lock so a concurrent remove_watch
                     // cannot free the slice while we are still reading from it.

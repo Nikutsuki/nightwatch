@@ -34,9 +34,19 @@ pub const Error = error{
     /// The user-supplied handler returned `error.HandlerFailed`.
     HandlerFailed,
     OutOfMemory,
-    /// The watch could not be registered (e.g. path does not exist, fd
-    /// limit reached, or the backend rejected the path).
+    /// The watch could not be registered for a reason other than a missing
+    /// path (e.g. the backend rejected the path).
     WatchFailed,
+    /// The watch could not be registered because the path does not exist.
+    NoEntry,
+    /// The OS refused the watch because a resource limit was reached:
+    /// ENOSPC from inotify_add_watch (fs.inotify.max_user_watches), or
+    /// EMFILE/ENFILE opening a kqueue descriptor (RLIMIT_NOFILE).
+    ///
+    /// Recursive enumeration stops when this is hit rather than retrying every
+    /// remaining path, so a `watch()` returning it has registered only part of
+    /// the tree. `watch_count()` reports how much.
+    WatchLimitReached,
 };
 
 /// Selects how the watcher delivers events to the caller.
@@ -95,7 +105,32 @@ pub const Handler = struct {
         /// (src -> dst) pair. `src` and `dst` are absolute paths valid only
         /// for the duration of the call.
         rename: *const fn (handler: *Handler, src_path: []const u8, dst_path: []const u8, object_type: ObjectType) error{HandlerFailed}!void,
+
+        /// Consulted before a watch is registered for a path discovered by
+        /// enumeration. Return false to skip it; for a directory that also skips
+        /// descending into it, so the whole subtree costs nothing.
+        ///
+        /// Never consulted for a path passed to `watch()` directly - an explicit
+        /// watch is always honored.
+        ///
+        /// Governs watch registration only, never event delivery: a skipped
+        /// directory still produces a `created` event of its own, from the watch
+        /// on its parent.
+        ///
+        /// May be called from the thread that calls `watch()`, from the backend
+        /// thread for `.threaded` variants, or from inside `handle_read_ready()`
+        /// for the `.polling` variant. It must be safe to call from any of them,
+        /// must not block indefinitely, and must not call back into the watcher.
+        ///
+        /// Null (the default) watches everything. Backends that watch a
+        /// subtree with a single registration ignore it entirely.
+        should_watch: ?*const fn (handler: *Handler, path: []const u8, object_type: ObjectType) bool = null,
     };
+
+    pub fn should_watch(handler: *Handler, path: []const u8, object_type: ObjectType) bool {
+        const f = handler.vtable.should_watch orelse return true;
+        return f(handler, path, object_type);
+    }
 
     pub fn change(handler: *Handler, path: []const u8, event_type: EventType, object_type: ObjectType) error{HandlerFailed}!void {
         return handler.vtable.change(handler, path, event_type, object_type);
@@ -134,7 +169,14 @@ pub const PollingHandler = struct {
         /// `handle_read_ready()` when `poll_fd()` becomes readable and return
         /// the appropriate `ReadableStatus`.
         wait_readable: *const fn (handler: *PollingHandler) error{HandlerFailed}!ReadableStatus,
+        /// See `Handler.VTable.should_watch`.
+        should_watch: ?*const fn (handler: *PollingHandler, path: []const u8, object_type: ObjectType) bool = null,
     };
+
+    pub fn should_watch(handler: *PollingHandler, path: []const u8, object_type: ObjectType) bool {
+        const f = handler.vtable.should_watch orelse return true;
+        return f(handler, path, object_type);
+    }
 
     pub fn change(handler: *PollingHandler, path: []const u8, event_type: EventType, object_type: ObjectType) error{HandlerFailed}!void {
         return handler.vtable.change(handler, path, event_type, object_type);

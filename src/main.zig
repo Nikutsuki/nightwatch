@@ -33,20 +33,30 @@ const CliHandler = struct {
             .change = change_cb,
             .rename = rename_cb,
             .wait_readable = wait_readable_cb,
+            .should_watch = should_watch_cb,
         },
         .threaded => .{
             .change = change_cb,
             .rename = rename_cb,
+            .should_watch = should_watch_cb,
         },
     };
 
-    fn change_cb(h: *Watcher.Handler, path: []const u8, event_type: nightwatch.EventType, object_type: nightwatch.ObjectType) error{HandlerFailed}!void {
+    /// --ignore: do not watch this path, or anything below it.
+    fn should_watch_cb(h: *Watcher.Handler, path: []const u8, _: nightwatch.ObjectType) bool {
         const self: *CliHandler = @fieldParentPtr("handler", h);
         for (self.ignore) |ignored| {
-            if (std.mem.eql(u8, path, ignored)) return;
+            if (!std.mem.startsWith(u8, path, ignored)) continue;
+            if (path.len == ignored.len) return false;
+            if (path[ignored.len] == std.fs.path.sep) return false;
         }
+        return true;
+    }
+
+    fn change_cb(h: *Watcher.Handler, path: []const u8, event_type: nightwatch.EventType, object_type: nightwatch.ObjectType) error{HandlerFailed}!void {
+        const self: *CliHandler = @fieldParentPtr("handler", h);
         var buf: [4096]u8 = undefined;
-        var w = std.Io.File.writer(self.out, self.io, &buf);
+        var w = std.Io.File.writerStreaming(self.out, self.io, &buf);
         defer w.flush() catch {};
         const color: std.Io.Terminal.Color = switch (event_type) {
             .created => .green,
@@ -71,11 +81,8 @@ const CliHandler = struct {
 
     fn rename_cb(h: *Watcher.Handler, src: []const u8, dst: []const u8, object_type: nightwatch.ObjectType) error{HandlerFailed}!void {
         const self: *CliHandler = @fieldParentPtr("handler", h);
-        for (self.ignore) |ignored| {
-            if (std.mem.eql(u8, src, ignored) or std.mem.eql(u8, dst, ignored)) return;
-        }
         var buf: [4096]u8 = undefined;
-        var w = std.Io.File.writer(self.out, self.io, &buf);
+        var w = std.Io.File.writerStreaming(self.out, self.io, &buf);
         defer w.flush() catch {};
         const tty = std.Io.Terminal{ .writer = &w.interface, .mode = self.tty_mode };
         tty.setColor(.magenta) catch return error.HandlerFailed;
@@ -151,15 +158,15 @@ fn run_windows(io: std.Io) void {
 
 fn usage(io: std.Io, out: std.Io.File) !void {
     var buf: [4096]u8 = undefined;
-    var writer = std.Io.File.writer(out, io, &buf);
+    var writer = std.Io.File.writerStreaming(out, io, &buf);
     try writer.interface.print(
-        \\Usage: nightwatch [--ignore <path>]... <path> [<path> ...]
+        \\Usage: nightwatch [--ignore <path>]... [--show-count] <path> [<path> ...]
         \\
         \\The Watch never sleeps.
         \\
         \\Options:
-        \\  --ignore <path>   Suppress events whose path exactly matches <path>.
-        \\                    May be specified multiple times.
+        \\  --ignore <path>   Do not watch <path> or anything below it. May be specified multiple times.
+        \\  --show-count      Print the number of registered watches on exit.
         \\
         \\Events printed to stdout (columns: event  type  path):
         \\  create    a file or directory was created
@@ -178,7 +185,7 @@ fn usage(io: std.Io, out: std.Io.File) !void {
 
 fn version(io: std.Io, out: std.Io.File) !void {
     var buf: [4096]u8 = undefined;
-    var writer = std.Io.File.writer(out, io, &buf);
+    var writer = std.Io.File.writerStreaming(out, io, &buf);
     try writer.interface.print(
         \\nightwatch version {s}
         \\using: {s}
@@ -218,10 +225,10 @@ pub fn main(init: std.process.Init) !void {
     }
 
     var buf: [4096]u8 = undefined;
-    var stderr = std.Io.File.writer(std.Io.File.stderr(), init.io, &buf);
+    var stderr = std.Io.File.writerStreaming(std.Io.File.stderr(), init.io, &buf);
     defer stderr.flush() catch {};
     var out_buf: [4096]u8 = undefined;
-    var stdout = std.Io.File.writer(std.Io.File.stdout(), init.io, &out_buf);
+    var stdout = std.Io.File.writerStreaming(std.Io.File.stdout(), init.io, &out_buf);
     defer stdout.flush() catch {};
 
     // Parse --ignore options and watch paths.
@@ -234,6 +241,7 @@ pub fn main(init: std.process.Init) !void {
     }
     var watch_paths = std.ArrayListUnmanaged([]const u8).empty;
     defer watch_paths.deinit(allocator);
+    var show_count = false;
 
     var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
     const cwd_len = try std.Io.Dir.cwd().realPathFile(init.io, ".", &cwd_buf);
@@ -253,6 +261,8 @@ pub fn main(init: std.process.Init) !void {
             else
                 try std.fs.path.join(allocator, &.{ cwd, raw });
             try ignore_list.append(allocator, abs);
+        } else if (std.mem.eql(u8, args[i], "--show-count")) {
+            show_count = true;
         } else {
             try watch_paths.append(allocator, args[i]);
         }
@@ -295,10 +305,18 @@ pub fn main(init: std.process.Init) !void {
     defer watcher.deinit();
 
     for (watch_paths.items) |path| {
-        watcher.watch(path) catch |err| {
-            try stderr.interface.print("nightwatch: {s}: {s}\n", .{ path, @errorName(err) });
-            continue;
+        const before = watcher.watch_count();
+        watcher.watch(path) catch |err| switch (err) {
+            error.WatchLimitReached => try stderr.interface.print(
+                "nightwatch: {s}: watch limit reached, holding {d} watches\n",
+                .{ path, watcher.watch_count() },
+            ),
+            else => {
+                try stderr.interface.print("nightwatch: {s}: {s}\n", .{ path, @errorName(err) });
+                continue;
+            },
         };
+        if (watcher.watch_count() == before) continue;
         (std.Io.Terminal{ .writer = &stdout.interface, .mode = tty_mode }).setColor(.dim) catch {};
         try stdout.interface.print("# on watch: {s}", .{path});
         (std.Io.Terminal{ .writer = &stdout.interface, .mode = tty_mode }).setColor(.reset) catch {};
@@ -312,5 +330,10 @@ pub fn main(init: std.process.Init) !void {
         run_windows(init.io);
     } else if (is_posix) {
         run_posix();
+    }
+
+    if (show_count) {
+        try stdout.interface.print("# watches: {d}\n", .{watcher.watch_count()});
+        try stdout.flush();
     }
 }

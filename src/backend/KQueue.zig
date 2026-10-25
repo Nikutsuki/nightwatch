@@ -5,6 +5,7 @@ const EventType = types.EventType;
 const ObjectType = types.ObjectType;
 
 pub const watches_recursively = false;
+pub const watches_files = true; // one open fd per file as well as per directory
 pub const detects_file_modifications = true;
 pub const emits_close_events = false;
 pub const emits_rename_for_files = false;
@@ -25,6 +26,7 @@ file_watches_mutex: std.Io.Mutex,
 snapshots: std.StringHashMapUnmanaged(std.StringHashMapUnmanaged(void)),
 snapshots_mutex: std.Io.Mutex,
 io: std.Io,
+limit_logged: std.atomic.Value(bool),
 
 const EVFILT_VNODE: i16 = -4;
 const EVFILT_READ: i16 = -1;
@@ -84,6 +86,7 @@ pub fn init(io: std.Io, handler: *Handler) !@This() {
         .file_watches_mutex = std.Io.Mutex.init,
         .snapshots = .empty,
         .snapshots_mutex = std.Io.Mutex.init,
+        .limit_logged = .init(false),
         .io = io,
     };
 }
@@ -137,7 +140,8 @@ fn thread_fn(self: *@This(), io: std.Io, allocator: std.mem.Allocator) void {
             if (ev.filter != EVFILT_VNODE) continue;
             const fd: std.posix.fd_t = @intCast(ev.ident);
 
-            // Check if this is a file watch: NOTE_WRITE/NOTE_EXTEND → modified.
+            // Check if this is a file watch: NOTE_WRITE/NOTE_EXTEND/NOTE_ATTRIB -> modified.
+            // A truncation without a write (`: > file`) reports only NOTE_ATTRIB.
             // Copy the path under the lock so a concurrent remove_watch cannot
             // free it before we finish using it.
             var file_path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -154,7 +158,17 @@ fn thread_fn(self: *@This(), io: std.Io, allocator: std.mem.Allocator) void {
             self.file_watches_mutex.unlock(io);
             if (file_path_len > 0) {
                 const fp = file_path_buf[0..file_path_len];
-                if (ev.fflags & (NOTE_WRITE | NOTE_EXTEND) != 0)
+                if (ev.fflags & (NOTE_DELETE | NOTE_RENAME) != 0) {
+                    self.deregister_file_watch(allocator, fp);
+                    std.Io.Dir.accessAbsolute(io, fp, .{}) catch continue;
+                    self.register_file_watch(allocator, fp) catch self.note_watch_limit(fp);
+                    self.handler.change(fp, EventType.modified, .file) catch |e| {
+                        std.log.err("nightwatch: handler returned {s}, stopping watch thread", .{@errorName(e)});
+                        return;
+                    };
+                    continue;
+                }
+                if (ev.fflags & (NOTE_WRITE | NOTE_EXTEND | NOTE_ATTRIB) != 0)
                     self.handler.change(fp, EventType.modified, .file) catch |e| {
                         std.log.err("nightwatch: handler returned {s}, stopping watch thread", .{@errorName(e)});
                         return;
@@ -300,10 +314,13 @@ fn scan_dir(self: *@This(), allocator: std.mem.Allocator, dir_path: []const u8) 
     // a rename (old disappears, new appears) reports the source path before the dest.
     for (new_dirs.items) |full_path| {
         try self.handler.change(full_path, EventType.created, .dir);
+        if (!self.handler.should_watch(full_path, .dir)) continue;
         // Start watching the moved-in dir so future changes inside it are detected
         // and so its deletion fires NOTE_DELETE rather than being silently missed.
-        self.add_watch(allocator, full_path) catch |e|
-            std.log.err("nightwatch: add_watch on moved-in dir failed: {s}", .{@errorName(e)});
+        self.add_watch(allocator, full_path) catch |e| switch (e) {
+            error.WatchLimitReached => self.note_watch_limit(full_path),
+            else => std.log.err("nightwatch: add_watch on moved-in dir failed: {s}", .{@errorName(e)}),
+        };
         try self.emit_subtree_created(allocator, full_path);
     }
     for (to_delete.items) |name| {
@@ -315,7 +332,7 @@ fn scan_dir(self: *@This(), allocator: std.mem.Allocator, dir_path: []const u8) 
     for (to_create.items) |name| {
         var path_buf: [std.fs.max_path_bytes]u8 = undefined;
         const full_path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ dir_path, name }) catch continue;
-        self.register_file_watch(allocator, full_path);
+        self.register_file_watch(allocator, full_path) catch self.note_watch_limit(full_path);
         try self.handler.change(full_path, EventType.created, .file);
     }
     // arena.deinit() frees current_files, current_dirs, new_dirs, and list metadata
@@ -339,17 +356,23 @@ fn emit_subtree_created(self: *@This(), allocator: std.mem.Allocator, dir_path: 
         const full_path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ dir_path, entry.name }) catch continue;
         try self.handler.change(full_path, EventType.created, ot);
         if (ot == .file) {
-            self.register_file_watch(allocator, full_path);
+            self.register_file_watch(allocator, full_path) catch self.note_watch_limit(full_path);
         } else {
+            // Skipping a directory skips everything below it too.
+            if (!self.handler.should_watch(full_path, .dir)) continue;
             // Watch nested subdirs so changes inside them are detected after move-in.
-            self.add_watch(allocator, full_path) catch |e|
-                std.log.err("nightwatch: add_watch on moved-in subdir failed: {s}", .{@errorName(e)});
+            self.add_watch(allocator, full_path) catch |e| switch (e) {
+                error.WatchLimitReached => self.note_watch_limit(full_path),
+                else => std.log.err("nightwatch: add_watch on moved-in subdir failed: {s}", .{@errorName(e)}),
+            };
             try self.emit_subtree_created(allocator, full_path);
         }
     }
 }
 
-fn register_file_watch(self: *@This(), allocator: std.mem.Allocator, path: []const u8) void {
+fn register_file_watch(self: *@This(), allocator: std.mem.Allocator, path: []const u8) error{WatchLimitReached}!void {
+    // Before the lock, so the predicate is never called with one held.
+    if (!self.handler.should_watch(path, .file)) return;
     self.file_watches_mutex.lockUncancelable(self.io);
     const already = self.file_watches.contains(path);
     self.file_watches_mutex.unlock(self.io);
@@ -357,14 +380,17 @@ fn register_file_watch(self: *@This(), allocator: std.mem.Allocator, path: []con
     const path_z = std.posix.toPosixPath(path) catch return;
     const fd: std.posix.fd_t = blk: {
         const raw = std.posix.system.open(&path_z, .{}, @as(c_uint, 0));
-        if (raw < 0) return;
+        if (raw < 0) switch (std.posix.errno(raw)) {
+            .MFILE, .NFILE => return error.WatchLimitReached,
+            else => return,
+        };
         break :blk @intCast(raw);
     };
     const kev = std.posix.Kevent{
         .ident = @intCast(fd),
         .filter = EVFILT_VNODE,
         .flags = EV_ADD | EV_ENABLE | EV_CLEAR,
-        .fflags = NOTE_WRITE | NOTE_EXTEND,
+        .fflags = NOTE_WRITE | NOTE_EXTEND | NOTE_ATTRIB | NOTE_DELETE | NOTE_RENAME,
         .data = 0,
         .udata = 0,
     };
@@ -392,6 +418,21 @@ fn register_file_watch(self: *@This(), allocator: std.mem.Allocator, path: []con
     self.file_watches_mutex.unlock(self.io);
 }
 
+pub fn watch_count(self: *@This()) usize {
+    self.watches_mutex.lockUncancelable(self.io);
+    const dirs = self.watches.count();
+    self.watches_mutex.unlock(self.io);
+    self.file_watches_mutex.lockUncancelable(self.io);
+    const files = self.file_watches.count();
+    self.file_watches_mutex.unlock(self.io);
+    return dirs + files;
+}
+
+pub fn note_watch_limit(self: *@This(), path: []const u8) void {
+    if (self.limit_logged.swap(true, .monotonic)) return;
+    std.log.err("nightwatch: watch limit reached at {s} after {d} watches; not watching further paths", .{ path, self.watch_count() });
+}
+
 fn deregister_file_watch(self: *@This(), allocator: std.mem.Allocator, path: []const u8) void {
     self.file_watches_mutex.lockUncancelable(self.io);
     const kv = self.file_watches.fetchRemove(path);
@@ -402,7 +443,7 @@ fn deregister_file_watch(self: *@This(), allocator: std.mem.Allocator, path: []c
     }
 }
 
-pub fn add_watch(self: *@This(), allocator: std.mem.Allocator, path: []const u8) error{ WatchFailed, OutOfMemory }!void {
+pub fn add_watch(self: *@This(), allocator: std.mem.Allocator, path: []const u8) error{ WatchFailed, OutOfMemory, NoEntry, WatchLimitReached }!void {
     self.watches_mutex.lockUncancelable(self.io);
     const already = self.watches.contains(path);
     self.watches_mutex.unlock(self.io);
@@ -411,8 +452,14 @@ pub fn add_watch(self: *@This(), allocator: std.mem.Allocator, path: []const u8)
     const path_fd: std.posix.fd_t = blk: {
         const raw = std.posix.system.open(&path_z, .{}, @as(c_uint, 0));
         if (raw < 0) {
-            std.log.err("{s} failed: open", .{@src().fn_name});
-            return error.WatchFailed;
+            switch (std.posix.errno(raw)) {
+                .NOENT => return error.NoEntry,
+                .MFILE, .NFILE => return error.WatchLimitReached,
+                else => |e| {
+                    std.log.err("{s} failed: open ({t})", .{ @src().fn_name, e });
+                    return error.WatchFailed;
+                },
+            }
         }
         break :blk @intCast(raw);
     };
@@ -446,6 +493,7 @@ pub fn add_watch(self: *@This(), allocator: std.mem.Allocator, path: []const u8)
     // Take initial snapshot so first NOTE_WRITE has a baseline to diff against.
     self.take_snapshot(allocator, owned_path) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
+        error.WatchLimitReached => return error.WatchLimitReached,
         else => |e_| {
             std.log.err("{s} failed: {t}", .{ @src().fn_name, e_ });
             return error.WatchFailed;
@@ -493,7 +541,7 @@ fn take_snapshot(self: *@This(), allocator: std.mem.Allocator, dir_path: []const
     for (names.items) |name| {
         var path_buf: [std.fs.max_path_bytes]u8 = undefined;
         const full_path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ dir_path, name }) catch continue;
-        self.register_file_watch(allocator, full_path);
+        try self.register_file_watch(allocator, full_path);
     }
 }
 

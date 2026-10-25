@@ -120,6 +120,16 @@ pub fn Create(comptime variant: Variant) type {
         pub const emits_rename_for_dirs = Backend.emits_rename_for_dirs;
         pub const emits_subtree_created_on_movein = Backend.emits_subtree_created_on_movein;
 
+        /// Whether `Handler.VTable.should_watch` can actually save resources here.
+        ///
+        /// False for backends that cover a whole subtree with one registration
+        /// (FSEvents, ReadDirectoryChangesW): there is no per-directory watch to
+        /// skip, so the predicate is never consulted.
+        pub const filters_watches: bool = !Backend.watches_recursively;
+        /// Whether this backend registers a watch per file as well as per
+        /// directory. When true the predicate is asked about files too.
+        pub const watches_files: bool = Backend.watches_files;
+
         /// Create a new watcher.
         ///
         /// `handler` must remain valid for the lifetime of the watcher. For
@@ -183,8 +193,17 @@ pub fn Create(comptime variant: Variant) type {
             defer self.allocator.free(norm);
             try self.interceptor.backend.add_watch(self.allocator, norm);
             if (!Backend.watches_recursively) {
-                recurse_watch(&self.interceptor.backend, self.io, self.allocator, norm);
+                try recurse_watch(&self.interceptor.backend, self.io, self.allocator, norm);
             }
+        }
+
+        /// Number of watch registrations currently held: directories, plus
+        /// individually watched files on backends that watch files.
+        ///
+        /// A `watch()` that returned `error.WatchLimitReached` watched only part
+        /// of its tree; this is how much.
+        pub fn watch_count(self: *const @This()) usize {
+            return self.interceptor.backend.watch_count();
         }
 
         const UnwatchReturnType = @typeInfo(@TypeOf(Backend.remove_watch)).@"fn".return_type orelse void;
@@ -239,15 +258,32 @@ pub fn Create(comptime variant: Variant) type {
             const vtable = Handler.VTable{
                 .change = change_cb,
                 .rename = rename_cb,
+                .should_watch = should_watch_cb,
             };
+
+            fn should_watch_cb(h: *Handler, path: []const u8, object_type: ObjectType) bool {
+                const self: *Interceptor = @fieldParentPtr("handler", h);
+                return self.user_handler.should_watch(path, object_type);
+            }
 
             fn change_cb(h: *Handler, path: []const u8, event_type: EventType, object_type: ObjectType) error{HandlerFailed}!void {
                 const self: *Interceptor = @fieldParentPtr("handler", h);
-                if (event_type == .created and object_type == .dir and !Backend.watches_recursively) {
-                    self.backend.add_watch(self.allocator, path) catch |e|
-                        std.log.err("nightwatch: add_watch failed for {s}: {s}", .{ path, @errorName(e) });
-                    recurse_watch(&self.backend, self.io, self.allocator, path);
-                }
+                if (comptime !Backend.watches_recursively) if (event_type == .created and object_type == .dir) blk: {
+                    if (!self.user_handler.should_watch(path, .dir)) break :blk;
+                    self.backend.add_watch(self.allocator, path) catch |e| switch (e) {
+                        error.NoEntry => break :blk,
+                        error.WatchLimitReached => {
+                            self.backend.note_watch_limit(path);
+                            break :blk;
+                        },
+                        else => |e_| {
+                            std.log.err("nightwatch: add_watch failed for {s}: {s}", .{ path, @errorName(e_) });
+                            break :blk;
+                        },
+                    };
+                    recurse_watch(&self.backend, self.io, self.allocator, path) catch
+                        self.backend.note_watch_limit(path);
+                };
                 return self.user_handler.change(path, event_type, object_type);
             }
 
@@ -268,17 +304,34 @@ pub fn Create(comptime variant: Variant) type {
                 .change = change_cb,
                 .rename = rename_cb,
                 .wait_readable = wait_readable_cb,
+                .should_watch = should_watch_cb,
             };
+
+            fn should_watch_cb(h: *PollingHandler, path: []const u8, object_type: ObjectType) bool {
+                const self: *PollingInterceptor = @fieldParentPtr("handler", h);
+                return self.user_handler.should_watch(path, object_type);
+            }
 
             const PollingHandler = types.PollingHandler;
 
             fn change_cb(h: *PollingHandler, path: []const u8, event_type: EventType, object_type: ObjectType) error{HandlerFailed}!void {
                 const self: *PollingInterceptor = @fieldParentPtr("handler", h);
-                if (event_type == .created and object_type == .dir and !Backend.watches_recursively) {
-                    self.backend.add_watch(self.allocator, path) catch |e|
-                        std.log.err("nightwatch: add_watch failed for {s}: {s}", .{ path, @errorName(e) });
-                    recurse_watch(&self.backend, self.io, self.allocator, path);
-                }
+                if (comptime !Backend.watches_recursively) if (event_type == .created and object_type == .dir) blk: {
+                    if (!self.user_handler.should_watch(path, .dir)) break :blk;
+                    self.backend.add_watch(self.allocator, path) catch |e| switch (e) {
+                        error.NoEntry => break :blk,
+                        error.WatchLimitReached => {
+                            self.backend.note_watch_limit(path);
+                            break :blk;
+                        },
+                        else => |e_| {
+                            std.log.err("nightwatch: add_watch failed for {s}: {s}", .{ path, @errorName(e_) });
+                            break :blk;
+                        },
+                    };
+                    recurse_watch(&self.backend, self.io, self.allocator, path) catch
+                        self.backend.note_watch_limit(path);
+                };
                 return self.user_handler.change(path, event_type, object_type);
             }
 
@@ -293,8 +346,12 @@ pub fn Create(comptime variant: Variant) type {
             }
         };
 
+        // for testing watch limits
+        pub var fault_inject_after: if (builtin.is_test) ?usize else void = if (builtin.is_test) null else {};
+        pub var fault_injected: usize = 0;
+
         // Scans subdirectories of dir_path and adds a watch for each one, recursively.
-        fn recurse_watch(backend: *Backend, io: std.Io, allocator: std.mem.Allocator, dir_path: []const u8) void {
+        fn recurse_watch(backend: *Backend, io: std.Io, allocator: std.mem.Allocator, dir_path: []const u8) error{WatchLimitReached}!void {
             var dir = std.Io.Dir.openDirAbsolute(io, dir_path, .{ .iterate = true }) catch return;
             defer dir.close(io);
             var it = dir.iterate();
@@ -302,9 +359,23 @@ pub fn Create(comptime variant: Variant) type {
                 if (entry.kind != .directory) continue;
                 var buf: [std.fs.max_path_bytes]u8 = undefined;
                 const sub = std.fmt.bufPrint(&buf, "{s}{c}{s}", .{ dir_path, std.fs.path.sep, entry.name }) catch continue;
-                backend.add_watch(allocator, sub) catch |e|
-                    std.log.err("nightwatch: add_watch failed for {s}: {s}", .{ sub, @errorName(e) });
-                recurse_watch(backend, io, allocator, sub);
+                // Skipping a directory skips its whole subtree.
+                if (!backend.handler.should_watch(sub, .dir)) continue;
+                if (comptime builtin.is_test) {
+                    if (fault_inject_after) |limit| {
+                        if (fault_injected >= limit) return error.WatchLimitReached;
+                        fault_injected += 1;
+                    }
+                }
+                backend.add_watch(allocator, sub) catch |e| switch (e) {
+                    error.NoEntry => continue,
+                    error.WatchLimitReached => return error.WatchLimitReached,
+                    else => |e_| {
+                        std.log.err("nightwatch: add_watch failed for {s}: {s}", .{ sub, @errorName(e_) });
+                        continue;
+                    },
+                };
+                try recurse_watch(backend, io, allocator, sub);
             }
         }
     };

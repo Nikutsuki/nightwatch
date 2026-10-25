@@ -5,6 +5,7 @@ const EventType = types.EventType;
 const ObjectType = types.ObjectType;
 
 pub const watches_recursively = true; // ReadDirectoryChangesW with bWatchSubtree=1
+pub const watches_files = false;
 pub const detects_file_modifications = true;
 pub const emits_close_events = false;
 pub const emits_rename_for_files = true;
@@ -335,7 +336,13 @@ fn thread_fn(
     }
 }
 
-pub fn add_watch(self: *@This(), allocator: std.mem.Allocator, path: []const u8) error{ OutOfMemory, WatchFailed }!void {
+pub fn watch_count(self: *@This()) usize {
+    self.watches_mutex.lockUncancelable(self.io);
+    defer self.watches_mutex.unlock(self.io);
+    return self.watches.count();
+}
+
+pub fn add_watch(self: *@This(), allocator: std.mem.Allocator, path: []const u8) error{ OutOfMemory, WatchFailed, NoEntry }!void {
     self.watches_mutex.lockUncancelable(self.io);
     defer self.watches_mutex.unlock(self.io);
     if (self.watches.contains(path)) return;
@@ -350,7 +357,12 @@ pub fn add_watch(self: *@This(), allocator: std.mem.Allocator, path: []const u8)
         0x02000000 | 0x40000000, // FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED
         null,
     );
-    if (handle == windows.INVALID_HANDLE_VALUE) return error.WatchFailed;
+    if (handle == windows.INVALID_HANDLE_VALUE) {
+        return switch (windows.GetLastError()) {
+            .FILE_NOT_FOUND, .PATH_NOT_FOUND => error.NoEntry,
+            else => error.WatchFailed,
+        };
+    }
     errdefer _ = win32.CloseHandle(handle);
     _ = win32.CreateIoCompletionPort(handle, self.iocp, @intFromPtr(handle), 0) orelse return error.WatchFailed;
     const buf = try allocator.alignedAlloc(u8, .fromByteUnits(4), buf_size);

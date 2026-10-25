@@ -5,6 +5,7 @@ const EventType = types.EventType;
 const ObjectType = types.ObjectType;
 
 pub const watches_recursively = false;
+pub const watches_files = false;
 pub const detects_file_modifications = false;
 pub const emits_close_events = false;
 pub const emits_rename_for_files = false;
@@ -25,6 +26,7 @@ watches_mutex: std.Io.Mutex,
 snapshots: std.StringHashMapUnmanaged(std.StringHashMapUnmanaged(std.Io.Timestamp)),
 snapshots_mutex: std.Io.Mutex,
 io: std.Io,
+limit_logged: std.atomic.Value(bool),
 
 const EVFILT_VNODE: i16 = -4;
 const EVFILT_READ: i16 = -1;
@@ -76,6 +78,7 @@ pub fn init(io: std.Io, handler: *Handler) !@This() {
         .snapshots = .empty,
         .snapshots_mutex = std.Io.Mutex.init,
         .io = io,
+        .limit_logged = .init(false),
     };
 }
 
@@ -294,10 +297,13 @@ fn scan_dir(self: *@This(), allocator: std.mem.Allocator, dir_path: []const u8) 
     // Order: new dirs, deletions (source before dest for renames), creations, modifications.
     for (new_dirs.items) |full_path| {
         try self.handler.change(full_path, EventType.created, .dir);
+        if (!self.handler.should_watch(full_path, .dir)) continue;
         // Start watching the moved-in dir so future changes inside it are detected
         // and so its deletion fires NOTE_DELETE rather than being silently missed.
-        self.add_watch(allocator, full_path) catch |e|
-            std.log.err("nightwatch: add_watch on moved-in dir failed: {s}", .{@errorName(e)});
+        self.add_watch(allocator, full_path) catch |e| switch (e) {
+            error.WatchLimitReached => self.note_watch_limit(full_path),
+            else => std.log.err("nightwatch: add_watch on moved-in dir failed: {s}", .{@errorName(e)}),
+        };
         try self.emit_subtree_created(allocator, full_path);
     }
     for (to_delete.items) |name| {
@@ -335,15 +341,30 @@ fn emit_subtree_created(self: *@This(), allocator: std.mem.Allocator, dir_path: 
         const full_path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ dir_path, entry.name }) catch continue;
         try self.handler.change(full_path, EventType.created, ot);
         if (ot == .dir) {
+            // Skipping a directory skips everything below it too.
+            if (!self.handler.should_watch(full_path, .dir)) continue;
             // Watch nested subdirs so changes inside them are detected after move-in.
-            self.add_watch(allocator, full_path) catch |e|
-                std.log.err("nightwatch: add_watch on moved-in subdir failed: {s}", .{@errorName(e)});
+            self.add_watch(allocator, full_path) catch |e| switch (e) {
+                error.WatchLimitReached => self.note_watch_limit(full_path),
+                else => std.log.err("nightwatch: add_watch on moved-in subdir failed: {s}", .{@errorName(e)}),
+            };
             try self.emit_subtree_created(allocator, full_path);
         }
     }
 }
 
-pub fn add_watch(self: *@This(), allocator: std.mem.Allocator, path: []const u8) error{ WatchFailed, OutOfMemory }!void {
+pub fn watch_count(self: *@This()) usize {
+    self.watches_mutex.lockUncancelable(self.io);
+    defer self.watches_mutex.unlock(self.io);
+    return self.watches.count();
+}
+
+pub fn note_watch_limit(self: *@This(), path: []const u8) void {
+    if (self.limit_logged.swap(true, .monotonic)) return;
+    std.log.err("nightwatch: watch limit reached at {s} after {d} watches; not watching further paths", .{ path, self.watch_count() });
+}
+
+pub fn add_watch(self: *@This(), allocator: std.mem.Allocator, path: []const u8) error{ WatchFailed, OutOfMemory, NoEntry, WatchLimitReached }!void {
     self.watches_mutex.lockUncancelable(self.io);
     const already = self.watches.contains(path);
     self.watches_mutex.unlock(self.io);
@@ -352,8 +373,14 @@ pub fn add_watch(self: *@This(), allocator: std.mem.Allocator, path: []const u8)
     const path_fd: std.posix.fd_t = blk: {
         const raw = std.posix.system.open(&path_z, .{}, @as(c_uint, 0));
         if (raw < 0) {
-            std.log.err("{s} failed: open", .{@src().fn_name});
-            return error.WatchFailed;
+            switch (std.posix.errno(raw)) {
+                .NOENT => return error.NoEntry,
+                .MFILE, .NFILE => return error.WatchLimitReached,
+                else => |e| {
+                    std.log.err("{s} failed: open ({t})", .{ @src().fn_name, e });
+                    return error.WatchFailed;
+                },
+            }
         }
         break :blk @intCast(raw);
     };

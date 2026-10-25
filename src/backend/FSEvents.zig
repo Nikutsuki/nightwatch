@@ -5,6 +5,7 @@ const EventType = types.EventType;
 const ObjectType = types.ObjectType;
 
 pub const watches_recursively = true; // FSEventStreamCreate watches the entire subtree
+pub const watches_files = false;
 pub const detects_file_modifications = true;
 pub const emits_close_events = false;
 pub const emits_rename_for_files = false;
@@ -291,8 +292,18 @@ fn emit_subtree_created(handler: *Handler, io: std.Io, dir_path: []const u8) voi
     }
 }
 
-pub fn add_watch(self: *@This(), allocator: std.mem.Allocator, path: []const u8) error{ WatchFailed, OutOfMemory }!void {
+pub fn watch_count(self: *@This()) usize {
+    return self.watches.count();
+}
+
+pub fn add_watch(self: *@This(), allocator: std.mem.Allocator, path: []const u8) error{ WatchFailed, OutOfMemory, NoEntry }!void {
     if (self.watches.contains(path)) return;
+    // FSEventStreamCreate does not itself fail for a path that doesn't
+    // exist, so check up front to match the other backends' behavior.
+    std.Io.Dir.accessAbsolute(self.io, path, .{}) catch |e| switch (e) {
+        error.FileNotFound => return error.NoEntry,
+        else => return error.WatchFailed,
+    };
     const owned = try allocator.dupe(u8, path);
     errdefer allocator.free(owned);
     try self.watches.put(allocator, owned, {});

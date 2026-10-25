@@ -145,8 +145,9 @@ fn makeTempDir(io: std.Io, allocator: std.mem.Allocator) ![]u8 {
         else => std.c.getpid(),
     };
     const name = if (builtin.os.tag == .windows) blk: {
-        const tmp_dir = std.process.getEnvVarOwned(allocator, "TEMP") catch
-            try std.process.getEnvVarOwned(allocator, "TMP");
+        const environ: std.process.Environ = .{ .block = .global };
+        const tmp_dir = environ.getAlloc(allocator, "TEMP") catch
+            try environ.getAlloc(allocator, "TMP");
         defer allocator.free(tmp_dir);
         break :blk try std.fmt.allocPrint(allocator, "{s}\\nightwatch_test_{d}_{d}", .{ tmp_dir, pid, n });
     } else try std.fmt.allocPrint(allocator, "/tmp/nightwatch_test_{d}_{d}", .{ pid, n });
@@ -169,6 +170,14 @@ fn makeTempDir(io: std.Io, allocator: std.mem.Allocator) ![]u8 {
 
 fn removeTempDir(io: std.Io, path: []const u8) void {
     std.Io.Dir.cwd().deleteTree(io, path) catch {};
+}
+
+/// Watch a path, skipping the test when the machine has no watch budget left.
+fn watchOrSkip(comptime Watcher: type, watcher: *Watcher, path: []const u8) !void {
+    watcher.watch(path) catch |e| switch (e) {
+        error.WatchLimitReached => return error.SkipZigTest,
+        else => |e_| return e_,
+    };
 }
 
 /// Drive event delivery for any Watcher variant.
@@ -198,7 +207,7 @@ fn testCreateFile(comptime Watcher: type, io: std.Io, allocator: std.mem.Allocat
 
     var watcher = try Watcher.init(io, allocator, &th.handler);
     defer watcher.deinit();
-    try watcher.watch(tmp);
+    try watchOrSkip(Watcher, &watcher, tmp);
 
     const file_path = try std.fs.path.join(allocator, &.{ tmp, "hello.txt" });
     defer allocator.free(file_path);
@@ -234,7 +243,7 @@ fn testModifyFile(comptime Watcher: type, io: std.Io, allocator: std.mem.Allocat
 
     var watcher = try Watcher.init(io, allocator, &th.handler);
     defer watcher.deinit();
-    try watcher.watch(tmp);
+    try watchOrSkip(Watcher, &watcher, tmp);
     // Drain before writing: FSEvents may deliver a coalesced create+modify if the
     // file was created just before the stream started. A drain here separates any
     // stale creation event from the upcoming write, so the write arrives in its
@@ -245,6 +254,43 @@ fn testModifyFile(comptime Watcher: type, io: std.Io, allocator: std.mem.Allocat
         const f = try std.Io.Dir.openFileAbsolute(io, file_path, .{ .mode = .write_only });
         defer f.close(io);
         try f.writeStreamingAll(io, "hello nightwatch\n");
+    }
+
+    try drainEvents(Watcher, io, &watcher);
+    try std.testing.expect(th.hasChange(file_path, .modified, .file));
+}
+
+fn testTruncateFile(comptime Watcher: type, io: std.Io, allocator: std.mem.Allocator) !void {
+    if (comptime !Watcher.detects_file_modifications) return error.SkipZigTest;
+
+    const TH = MakeTestHandler(Watcher);
+
+    const tmp = try makeTempDir(io, allocator);
+    defer {
+        removeTempDir(io, tmp);
+        allocator.free(tmp);
+    }
+
+    const th = try TH.init(allocator);
+    defer th.deinit();
+
+    const file_path = try std.fs.path.join(allocator, &.{ tmp, "data.txt" });
+    defer allocator.free(file_path);
+    {
+        const f = try std.Io.Dir.createFileAbsolute(io, file_path, .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io, "hello nightwatch\n");
+    }
+
+    var watcher = try Watcher.init(io, allocator, &th.handler);
+    defer watcher.deinit();
+    try watchOrSkip(Watcher, &watcher, tmp);
+    try drainEvents(Watcher, io, &watcher);
+
+    // Truncate to empty without writing, as `: > file` does.
+    {
+        const f = try std.Io.Dir.createFileAbsolute(io, file_path, .{ .truncate = true });
+        f.close(io);
     }
 
     try drainEvents(Watcher, io, &watcher);
@@ -274,7 +320,7 @@ fn testCloseFile(comptime Watcher: type, io: std.Io, allocator: std.mem.Allocato
 
     var watcher = try Watcher.init(io, allocator, &th.handler);
     defer watcher.deinit();
-    try watcher.watch(tmp);
+    try watchOrSkip(Watcher, &watcher, tmp);
 
     {
         const f = try std.Io.Dir.openFileAbsolute(io, file_path, .{ .mode = .write_only });
@@ -304,7 +350,7 @@ fn testDeleteFile(comptime Watcher: type, io: std.Io, allocator: std.mem.Allocat
 
     var watcher = try Watcher.init(io, allocator, &th.handler);
     defer watcher.deinit();
-    try watcher.watch(tmp);
+    try watchOrSkip(Watcher, &watcher, tmp);
 
     {
         const f = try std.Io.Dir.createFileAbsolute(io, file_path, .{});
@@ -316,6 +362,27 @@ fn testDeleteFile(comptime Watcher: type, io: std.Io, allocator: std.mem.Allocat
     try drainEvents(Watcher, io, &watcher);
 
     try std.testing.expect(th.hasChange(file_path, .deleted, .file));
+}
+
+fn testWatchNonexistentPath(comptime Watcher: type, io: std.Io, allocator: std.mem.Allocator) !void {
+    const TH = MakeTestHandler(Watcher);
+
+    const tmp = try makeTempDir(io, allocator);
+    defer {
+        removeTempDir(io, tmp);
+        allocator.free(tmp);
+    }
+
+    const th = try TH.init(allocator);
+    defer th.deinit();
+
+    var watcher = try Watcher.init(io, allocator, &th.handler);
+    defer watcher.deinit();
+
+    const missing_path = try std.fs.path.join(allocator, &.{ tmp, "does-not-exist" });
+    defer allocator.free(missing_path);
+
+    try std.testing.expectError(error.NoEntry, watcher.watch(missing_path));
 }
 
 fn testCreateSubdir(comptime Watcher: type, io: std.Io, allocator: std.mem.Allocator) !void {
@@ -332,7 +399,7 @@ fn testCreateSubdir(comptime Watcher: type, io: std.Io, allocator: std.mem.Alloc
 
     var watcher = try Watcher.init(io, allocator, &th.handler);
     defer watcher.deinit();
-    try watcher.watch(tmp);
+    try watchOrSkip(Watcher, &watcher, tmp);
 
     const dir_path = try std.fs.path.join(allocator, &.{ tmp, "subdir" });
     defer allocator.free(dir_path);
@@ -360,7 +427,7 @@ fn testDeleteSubdir(comptime Watcher: type, io: std.Io, allocator: std.mem.Alloc
 
     var watcher = try Watcher.init(io, allocator, &th.handler);
     defer watcher.deinit();
-    try watcher.watch(tmp);
+    try watchOrSkip(Watcher, &watcher, tmp);
 
     try drainEvents(Watcher, io, &watcher);
 
@@ -394,7 +461,7 @@ fn testRenameFile(comptime Watcher: type, io: std.Io, allocator: std.mem.Allocat
 
     var watcher = try Watcher.init(io, allocator, &th.handler);
     defer watcher.deinit();
-    try watcher.watch(tmp);
+    try watchOrSkip(Watcher, &watcher, tmp);
 
     try std.Io.Dir.renameAbsolute(src_path, dst_path, io);
     try drainEvents(Watcher, io, &watcher);
@@ -430,7 +497,7 @@ fn testRenameDir(comptime Watcher: type, io: std.Io, allocator: std.mem.Allocato
 
     var watcher = try Watcher.init(io, allocator, &th.handler);
     defer watcher.deinit();
-    try watcher.watch(tmp);
+    try watchOrSkip(Watcher, &watcher, tmp);
 
     try std.Io.Dir.renameAbsolute(src_path, dst_path, io);
     try drainEvents(Watcher, io, &watcher);
@@ -463,7 +530,7 @@ fn testUnwatchedDir(comptime Watcher: type, io: std.Io, allocator: std.mem.Alloc
 
     var watcher = try Watcher.init(io, allocator, &th.handler);
     defer watcher.deinit();
-    try watcher.watch(watched);
+    try watchOrSkip(Watcher, &watcher, watched);
 
     const file_path = try std.fs.path.join(allocator, &.{ unwatched, "silent.txt" });
     defer allocator.free(file_path);
@@ -490,7 +557,7 @@ fn testUnwatch(comptime Watcher: type, io: std.Io, allocator: std.mem.Allocator)
 
     var watcher = try Watcher.init(io, allocator, &th.handler);
     defer watcher.deinit();
-    try watcher.watch(tmp);
+    try watchOrSkip(Watcher, &watcher, tmp);
 
     const file1 = try std.fs.path.join(allocator, &.{ tmp, "watched.txt" });
     defer allocator.free(file1);
@@ -529,7 +596,7 @@ fn testMultipleFiles(comptime Watcher: type, io: std.Io, allocator: std.mem.Allo
 
     var watcher = try Watcher.init(io, allocator, &th.handler);
     defer watcher.deinit();
-    try watcher.watch(tmp);
+    try watchOrSkip(Watcher, &watcher, tmp);
 
     const N = 5;
     var paths: [N][]u8 = undefined;
@@ -573,7 +640,7 @@ fn testRenameOrder(comptime Watcher: type, io: std.Io, allocator: std.mem.Alloca
 
     var watcher = try Watcher.init(io, allocator, &th.handler);
     defer watcher.deinit();
-    try watcher.watch(tmp);
+    try watchOrSkip(Watcher, &watcher, tmp);
 
     try std.Io.Dir.renameAbsolute(src_path, dst_path, io);
     try drainEvents(Watcher, io, &watcher);
@@ -616,7 +683,7 @@ fn testRenameThenModify(comptime Watcher: type, io: std.Io, allocator: std.mem.A
 
     var watcher = try Watcher.init(io, allocator, &th.handler);
     defer watcher.deinit();
-    try watcher.watch(tmp);
+    try watchOrSkip(Watcher, &watcher, tmp);
 
     try std.Io.Dir.renameAbsolute(src_path, dst_path, io);
     try drainEvents(Watcher, io, &watcher);
@@ -641,6 +708,62 @@ fn testRenameThenModify(comptime Watcher: type, io: std.Io, allocator: std.mem.A
     try std.testing.expect(rename_idx < modify_idx);
 }
 
+fn testReplaceThenModify(comptime Watcher: type, io: std.Io, allocator: std.mem.Allocator) !void {
+    if (comptime !Watcher.detects_file_modifications) return error.SkipZigTest;
+
+    const TH = MakeTestHandler(Watcher);
+
+    const tmp = try makeTempDir(io, allocator);
+    defer {
+        removeTempDir(io, tmp);
+        allocator.free(tmp);
+    }
+
+    const th = try TH.init(allocator);
+    defer th.deinit();
+
+    const file_path = try std.fs.path.join(allocator, &.{ tmp, "file.txt" });
+    defer allocator.free(file_path);
+    const tmp_path = try std.fs.path.join(allocator, &.{ tmp, "file.txt.tmp" });
+    defer allocator.free(tmp_path);
+
+    {
+        const f = try std.Io.Dir.createFileAbsolute(io, file_path, .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io, "original\n");
+    }
+
+    var watcher = try Watcher.init(io, allocator, &th.handler);
+    defer watcher.deinit();
+    try watchOrSkip(Watcher, &watcher, tmp);
+
+    {
+        const f = try std.Io.Dir.createFileAbsolute(io, tmp_path, .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io, "replaced\n");
+    }
+    try std.Io.Dir.renameAbsolute(tmp_path, file_path, io);
+    try drainEvents(Watcher, io, &watcher);
+
+    _ = th.indexOfRename(tmp_path, file_path) orelse
+        th.indexOfAnyPath(file_path) orelse
+        return error.MissingReplaceEvent;
+    const after_replace = th.events.items.len;
+
+    {
+        const f = try std.Io.Dir.openFileAbsolute(io, file_path, .{ .mode = .write_only });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "modified after replace\n");
+    }
+    try drainEvents(Watcher, io, &watcher);
+
+    for (th.events.items[after_replace..]) |event| switch (event) {
+        .change => |c| if (c.event_type == .modified and std.mem.eql(u8, c.path, file_path)) return,
+        else => {},
+    };
+    return error.MissingModifyAfterReplace;
+}
+
 fn testMoveOutFile(comptime Watcher: type, io: std.Io, allocator: std.mem.Allocator) !void {
     const TH = MakeTestHandler(Watcher);
 
@@ -660,7 +783,7 @@ fn testMoveOutFile(comptime Watcher: type, io: std.Io, allocator: std.mem.Alloca
 
     var watcher = try Watcher.init(io, allocator, &th.handler);
     defer watcher.deinit();
-    try watcher.watch(watched);
+    try watchOrSkip(Watcher, &watcher, watched);
 
     const src_path = try std.fs.path.join(allocator, &.{ watched, "moveme.txt" });
     defer allocator.free(src_path);
@@ -701,7 +824,7 @@ fn testMoveInFile(comptime Watcher: type, io: std.Io, allocator: std.mem.Allocat
 
     var watcher = try Watcher.init(io, allocator, &th.handler);
     defer watcher.deinit();
-    try watcher.watch(watched);
+    try watchOrSkip(Watcher, &watcher, watched);
 
     const src_path = try std.fs.path.join(allocator, &.{ other, "moveme.txt" });
     defer allocator.free(src_path);
@@ -741,7 +864,7 @@ fn testMoveInSubdir(comptime Watcher: type, io: std.Io, allocator: std.mem.Alloc
 
     var watcher = try Watcher.init(io, allocator, &th.handler);
     defer watcher.deinit();
-    try watcher.watch(watched);
+    try watchOrSkip(Watcher, &watcher, watched);
 
     const src_sub = try std.fs.path.join(allocator, &.{ other, "sub" });
     defer allocator.free(src_sub);
@@ -780,6 +903,226 @@ fn testMoveInSubdir(comptime Watcher: type, io: std.Io, allocator: std.mem.Alloc
     try std.testing.expect(th.hasChange(dst_sub, .deleted, .dir));
 }
 
+fn makeDirTree(io: std.Io, root: []const u8, comptime rel: []const []const u8) !void {
+    for (rel) |r| {
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        const path = try std.fmt.bufPrint(&buf, "{s}/{s}", .{ root, r });
+        try std.Io.Dir.createDirAbsolute(io, path, .default_dir);
+    }
+}
+
+fn testWatchCount(comptime Watcher: type, io: std.Io, allocator: std.mem.Allocator) !void {
+    const tmp = try makeTempDir(io, allocator);
+    defer allocator.free(tmp);
+    defer removeTempDir(io, tmp);
+
+    // Directories only: on kqueue watch_count also counts per-file watches.
+    try makeDirTree(io, tmp, &.{ "a", "a/b", "c" });
+
+    const th = try MakeTestHandler(Watcher).init(allocator);
+    defer th.deinit();
+    var watcher = try Watcher.init(io, allocator, &th.handler);
+    defer watcher.deinit();
+
+    try watchOrSkip(Watcher, &watcher, tmp);
+
+    // Recursive backends register the whole subtree with one watch.
+    const expected: usize = if (comptime Watcher.Backend.watches_recursively) 1 else 4;
+    try std.testing.expectEqual(expected, watcher.watch_count());
+
+    try watcher.unwatch(tmp);
+    try std.testing.expectEqual(expected - 1, watcher.watch_count());
+}
+
+fn testWatchLimitStopsDescent(comptime Watcher: type, io: std.Io, allocator: std.mem.Allocator) !void {
+    // Recursive backends never enumerate, so there is no descent to stop.
+    if (comptime Watcher.Backend.watches_recursively) return error.SkipZigTest;
+
+    const tmp = try makeTempDir(io, allocator);
+    defer allocator.free(tmp);
+    defer removeTempDir(io, tmp);
+
+    try makeDirTree(io, tmp, &.{ "a", "a/b", "a/b/c", "d", "d/e" });
+
+    const th = try MakeTestHandler(Watcher).init(allocator);
+    defer th.deinit();
+    var watcher = try Watcher.init(io, allocator, &th.handler);
+    defer watcher.deinit();
+
+    Watcher.fault_inject_after = 2;
+    defer {
+        Watcher.fault_inject_after = null;
+        Watcher.fault_injected = 0;
+    }
+
+    // The limit reaches the caller instead of being logged per directory.
+    try std.testing.expectError(error.WatchLimitReached, watcher.watch(tmp));
+
+    // A host that is itself out of watches refuses the root too, so nothing was
+    // registered and there is no descent to have stopped.
+    if (watcher.watch_count() == 0) return error.SkipZigTest;
+
+    // Root plus the two the injection allowed, and no more: enumeration stopped
+    // rather than trying every remaining directory.
+    try std.testing.expectEqual(@as(usize, 3), watcher.watch_count());
+}
+
+fn MakeFilterHandler(comptime Watcher: type) type {
+    const H = Watcher.Handler;
+    return struct {
+        handler: H,
+        reject_prefix: []const u8,
+        asked_files: usize = 0,
+
+        const vtable: H.VTable = if (Watcher.interface_type == .polling) .{
+            .change = change_cb,
+            .rename = rename_cb,
+            .should_watch = should_watch_cb,
+            .wait_readable = struct {
+                fn f(_: *H) error{HandlerFailed}!H.ReadableStatus {
+                    return .will_notify;
+                }
+            }.f,
+        } else .{
+            .change = change_cb,
+            .rename = rename_cb,
+            .should_watch = should_watch_cb,
+        };
+
+        fn change_cb(_: *H, _: []const u8, _: nw.EventType, _: nw.ObjectType) error{HandlerFailed}!void {}
+        fn rename_cb(_: *H, _: []const u8, _: []const u8, _: nw.ObjectType) error{HandlerFailed}!void {}
+
+        fn should_watch_cb(h: *H, path: []const u8, object_type: nw.ObjectType) bool {
+            const self: *@This() = @fieldParentPtr("handler", h);
+            if (object_type == .file) self.asked_files += 1;
+            return !std.mem.startsWith(u8, path, self.reject_prefix);
+        }
+    };
+}
+
+fn testPredicatePrunesSubtree(comptime Watcher: type, io: std.Io, allocator: std.mem.Allocator) !void {
+    if (comptime !Watcher.filters_watches) return error.SkipZigTest;
+
+    const tmp = try makeTempDir(io, allocator);
+    defer allocator.free(tmp);
+    defer removeTempDir(io, tmp);
+
+    try makeDirTree(io, tmp, &.{ "keep", "keep/inner", "skip", "skip/a", "skip/a/b" });
+
+    var skip_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const skip_path = try std.fmt.bufPrint(&skip_path_buf, "{s}/skip", .{tmp});
+
+    var fh = MakeFilterHandler(Watcher){
+        .handler = .{ .vtable = &MakeFilterHandler(Watcher).vtable },
+        .reject_prefix = skip_path,
+    };
+    var watcher = try Watcher.init(io, allocator, &fh.handler);
+    defer watcher.deinit();
+
+    try watchOrSkip(Watcher, &watcher, tmp);
+
+    // tmp, keep, keep/inner. The three under skip/ cost nothing at all.
+    try std.testing.expectEqual(@as(usize, 3), watcher.watch_count());
+}
+
+fn testExplicitWatchBeatsPredicate(comptime Watcher: type, io: std.Io, allocator: std.mem.Allocator) !void {
+    const tmp = try makeTempDir(io, allocator);
+    defer allocator.free(tmp);
+    defer removeTempDir(io, tmp);
+
+    // Reject everything, then ask for the root by name anyway.
+    var fh = MakeFilterHandler(Watcher){
+        .handler = .{ .vtable = &MakeFilterHandler(Watcher).vtable },
+        .reject_prefix = "/",
+    };
+    var watcher = try Watcher.init(io, allocator, &fh.handler);
+    defer watcher.deinit();
+
+    try watchOrSkip(Watcher, &watcher, tmp);
+    try std.testing.expect(watcher.watch_count() >= 1);
+}
+
+fn testPredicateAppliesToNewDirs(comptime Watcher: type, io: std.Io, allocator: std.mem.Allocator) !void {
+    if (comptime !Watcher.filters_watches) return error.SkipZigTest;
+
+    const tmp = try makeTempDir(io, allocator);
+    defer allocator.free(tmp);
+    defer removeTempDir(io, tmp);
+
+    var skip_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const skip_path = try std.fmt.bufPrint(&skip_path_buf, "{s}/skip", .{tmp});
+
+    var fh = MakeFilterHandler(Watcher){
+        .handler = .{ .vtable = &MakeFilterHandler(Watcher).vtable },
+        .reject_prefix = skip_path,
+    };
+    var watcher = try Watcher.init(io, allocator, &fh.handler);
+    defer watcher.deinit();
+
+    try watchOrSkip(Watcher, &watcher, tmp);
+    const before = watcher.watch_count();
+
+    // Created after the initial enumeration: the interceptor must consult the
+    // predicate too, not just recurse_watch.
+    try makeDirTree(io, tmp, &.{"skip"});
+    try drainEvents(Watcher, io, &watcher);
+    try std.testing.expectEqual(before, watcher.watch_count());
+
+    try makeDirTree(io, tmp, &.{"keep"});
+    try drainEvents(Watcher, io, &watcher);
+    try std.testing.expectEqual(before + 1, watcher.watch_count());
+}
+
+fn testPredicateAppliesToFiles(comptime Watcher: type, io: std.Io, allocator: std.mem.Allocator) !void {
+    // Only kqueue registers a watch per file; elsewhere there is nothing to skip.
+    if (comptime !Watcher.watches_files) return error.SkipZigTest;
+
+    const tmp = try makeTempDir(io, allocator);
+    defer allocator.free(tmp);
+    defer removeTempDir(io, tmp);
+
+    var skip_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const skip_file = try std.fmt.bufPrint(&skip_buf, "{s}/skipped.txt", .{tmp});
+    var keep_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const keep_file = try std.fmt.bufPrint(&keep_buf, "{s}/kept.txt", .{tmp});
+    for ([_][]const u8{ skip_file, keep_file }) |f| {
+        var fh_ = try std.Io.Dir.createFileAbsolute(io, f, .{});
+        fh_.close(io);
+    }
+
+    var fh = MakeFilterHandler(Watcher){
+        .handler = .{ .vtable = &MakeFilterHandler(Watcher).vtable },
+        .reject_prefix = skip_file,
+    };
+    var watcher = try Watcher.init(io, allocator, &fh.handler);
+    defer watcher.deinit();
+
+    try watchOrSkip(Watcher, &watcher, tmp);
+
+    try std.testing.expect(fh.asked_files > 0);
+    // The directory plus the one file that was not rejected.
+    try std.testing.expectEqual(@as(usize, 2), watcher.watch_count());
+}
+
+fn testNullPredicateWatchesEverything(comptime Watcher: type, io: std.Io, allocator: std.mem.Allocator) !void {
+    if (comptime !Watcher.filters_watches) return error.SkipZigTest;
+
+    const tmp = try makeTempDir(io, allocator);
+    defer allocator.free(tmp);
+    defer removeTempDir(io, tmp);
+
+    try makeDirTree(io, tmp, &.{ "a", "a/b", "c" });
+
+    // MakeTestHandler leaves should_watch null, as every pre-existing user does.
+    const th = try MakeTestHandler(Watcher).init(allocator);
+    defer th.deinit();
+    var watcher = try Watcher.init(io, allocator, &th.handler);
+    defer watcher.deinit();
+
+    try watchOrSkip(Watcher, &watcher, tmp);
+    try std.testing.expectEqual(@as(usize, 4), watcher.watch_count());
+}
+
 // ---------------------------------------------------------------------------
 // Test blocks - each runs its case across all available variants.
 // ---------------------------------------------------------------------------
@@ -793,6 +1136,14 @@ test "creating a file emits a 'created' event" {
 test "writing to a file emits a 'modified' event" {
     inline for (comptime std.enums.values(nw.Variant)) |variant| {
         testModifyFile(nw.Create(variant), std.testing.io, std.testing.allocator) catch |e| {
+            if (e != error.SkipZigTest) return e;
+        };
+    }
+}
+
+test "truncating a file to empty emits a 'modified' event" {
+    inline for (comptime std.enums.values(nw.Variant)) |variant| {
+        testTruncateFile(nw.Create(variant), std.testing.io, std.testing.allocator) catch |e| {
             if (e != error.SkipZigTest) return e;
         };
     }
@@ -813,6 +1164,12 @@ test "deleting a file emits a 'deleted' event" {
 test "deleting a dir emits a 'deleted' event" {
     inline for (comptime std.enums.values(nw.Variant)) |variant| {
         try testDeleteSubdir(nw.Create(variant), std.testing.io, std.testing.allocator);
+    }
+}
+
+test "watching a nonexistent path returns error.NoEntry" {
+    inline for (comptime std.enums.values(nw.Variant)) |variant| {
+        try testWatchNonexistentPath(nw.Create(variant), std.testing.io, std.testing.allocator);
     }
 }
 
@@ -866,6 +1223,14 @@ test "rename-then-modify: rename event precedes the subsequent modify event" {
     }
 }
 
+test "replacing a watched file by rename keeps reporting changes to it" {
+    inline for (comptime std.enums.values(nw.Variant)) |variant| {
+        testReplaceThenModify(nw.Create(variant), std.testing.io, std.testing.allocator) catch |e| {
+            if (e != error.SkipZigTest) return e;
+        };
+    }
+}
+
 test "moving a file out of the watched tree appears as deleted or renamed" {
     inline for (comptime std.enums.values(nw.Variant)) |variant| {
         try testMoveOutFile(nw.Create(variant), std.testing.io, std.testing.allocator);
@@ -882,4 +1247,64 @@ test "moving a subdir into the watched tree: contents can be deleted with correc
     inline for (comptime std.enums.values(nw.Variant)) |variant| {
         try testMoveInSubdir(nw.Create(variant), std.testing.io, std.testing.allocator);
     }
+}
+
+test "watch_count reports registered watches" {
+    // Skip only if no variant ran at all, so a variant that opts out does not
+    // make this look like it passed.
+    var ran = false;
+    inline for (comptime std.enums.values(nw.Variant)) |variant| {
+        if (testWatchCount(nw.Create(variant), std.testing.io, std.testing.allocator)) {
+            ran = true;
+        } else |e| {
+            if (e != error.SkipZigTest) return e;
+        }
+    }
+    if (!ran) return error.SkipZigTest;
+}
+
+test "a watch limit stops the descent and reaches the caller" {
+    // Skip only if no variant ran at all, so a variant that opts out does not
+    // make this look like it passed.
+    var ran = false;
+    inline for (comptime std.enums.values(nw.Variant)) |variant| {
+        if (testWatchLimitStopsDescent(nw.Create(variant), std.testing.io, std.testing.allocator)) {
+            ran = true;
+        } else |e| {
+            if (e != error.SkipZigTest) return e;
+        }
+    }
+    if (!ran) return error.SkipZigTest;
+}
+
+fn runAllVariants(comptime f: anytype) !void {
+    var ran = false;
+    inline for (comptime std.enums.values(nw.Variant)) |variant| {
+        if (f(nw.Create(variant), std.testing.io, std.testing.allocator)) {
+            ran = true;
+        } else |e| {
+            if (e != error.SkipZigTest) return e;
+        }
+    }
+    if (!ran) return error.SkipZigTest;
+}
+
+test "should_watch prunes a directory and its whole subtree" {
+    try runAllVariants(testPredicatePrunesSubtree);
+}
+
+test "an explicit watch() is honored even when the predicate rejects it" {
+    try runAllVariants(testExplicitWatchBeatsPredicate);
+}
+
+test "should_watch is consulted for directories created after watch()" {
+    try runAllVariants(testPredicateAppliesToNewDirs);
+}
+
+test "should_watch is consulted per file where files are watched" {
+    try runAllVariants(testPredicateAppliesToFiles);
+}
+
+test "a null should_watch watches everything" {
+    try runAllVariants(testNullPredicateWatchesEverything);
 }
