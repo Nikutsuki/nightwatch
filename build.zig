@@ -35,15 +35,8 @@ pub fn build(b: *std.Build) void {
         mod.linkFramework("CoreFoundation", .{});
     }
 
-    var version: std.Io.Writer.Allocating = .init(b.allocator);
-    defer version.deinit();
-    gen_version(b, &version.writer) catch |e| {
-        if (b.graph.release_mode != .off)
-            std.debug.panic("gen_version failed: {any}", .{e});
-        version.writer.writeAll("unknown") catch {};
-    };
     const write_file_step = b.addWriteFiles();
-    const version_file = write_file_step.add("version", version.written());
+    const version_file = write_file_step.add("version", "1.0.0");
 
     const exe = b.addExecutable(.{
         .name = "nightwatch",
@@ -96,15 +89,4 @@ pub fn build(b: *std.Build) void {
     if (install_tests) {
         b.installArtifact(tests);
     }
-}
-
-fn gen_version(b: *std.Build, writer: *std.Io.Writer) !void {
-    var code: u8 = 0;
-
-    const describe = try b.runAllowFail(&[_][]const u8{ "git", "describe", "--always", "--tags" }, &code, .ignore);
-    const diff_ = try b.runAllowFail(&[_][]const u8{ "git", "diff", "--stat", "--patch", "HEAD" }, &code, .ignore);
-    const diff = std.mem.trimEnd(u8, diff_, "\r\n ");
-    const version = std.mem.trimEnd(u8, describe, "\r\n ");
-
-    try writer.print("{s}{s}", .{ version, if (diff.len > 0) "-dirty" else "" });
 }
